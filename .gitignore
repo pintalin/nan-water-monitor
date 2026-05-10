@@ -1,0 +1,20 @@
+# ไฟล์ลับ — ห้าม push ขึ้น GitHub
+.env
+
+# ไฟล์ข้อมูล local (จะเก็บบน persistent volume แทน)
+state.json
+settings.json
+water_history.db
+
+# Node.js (ไม่ใช้แล้ว)
+node_modules/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Logs
+logs/
+*.log
