@@ -9,6 +9,8 @@ import anthropic
 import requests
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
@@ -152,24 +154,243 @@ def load_state() -> dict:
 def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding='utf-8')
 
+# ── Logic เครื่องสูบน้ำ ───────────────────────────────────────────────────
+def get_pump_state(pct: float, cfg: dict, demand_now: float = 0) -> tuple:
+    """
+    คืนค่า (จำนวนเครื่อง, กำลังผลิต ลบ.ม./ชม., label, badge_color)
+    Logic:
+      ถังเต็ม (≥100%)              → หยุดสูบ (0 เครื่อง)
+      ถัง ≥90% & demand ≤300       → 1 เครื่อง = PROD1  (ประหยัด)
+      ถัง ≥90% & demand >300       → 2 เครื่อง = PROD2  (รักษาระดับ 80-90%)
+      ถัง 70–89%                   → 2 เครื่อง = PROD2  (ปกติ)
+      ถัง <70%                     → 2 เครื่อง = PROD2  (เฝ้าระวัง/วิกฤต)
+    ช่วงลดแรงดัน: 22:00–05:00 น. ทุกวัน (LOW_P)
+    """
+    prod2 = cfg['prod_2_pump']
+    prod1 = cfg['prod_1_pump']
+    if pct >= 100:
+        return 0, 0,     'หยุด (ถังเต็ม)',         '#6b7280'
+    elif pct >= 90:
+        if demand_now > 300:
+            return 2, prod2, '2 เครื่อง (demand สูง)', '#f59e0b'
+        return 1, prod1,     '1 เครื่อง',              '#0ea5e9'
+    elif pct >= 70:
+        return 2, prod2, '2 เครื่อง', '#22c55e'
+    else:
+        return 2, prod2, '2 เครื่อง', '#ef4444'
+
 # ── Simulation ────────────────────────────────────────────────────────────
 def sim_forward(vol: float, start_hour: int, steps: int = 1,
                 cfg: dict = None, weather: dict = None) -> float:
     if cfg is None:
         cfg = load_settings()
     demand = get_demand_with_weather(cfg['demand'], weather) if weather else cfg['demand']
-    prod2  = cfg['prod_2_pump']
-    prod1  = cfg['prod_1_pump']
     for i in range(steps):
-        h    = (start_hour + i) % 24
-        prod = prod1 if vol >= CAPACITY else prod2
-        vol  = max(0.0, min(float(CAPACITY), vol + prod - demand[h]))
+        h             = (start_hour + i) % 24
+        pct_now       = vol / CAPACITY * 100
+        _, prod, _, _ = get_pump_state(pct_now, cfg, demand[h])
+        vol           = max(0.0, min(float(CAPACITY), vol + prod - demand[h]))
     return vol
 
 def get_status(pct: float):
-    if pct >= 60: return ('ปกติ',  '🟢', '#28a745')
-    if pct >= 50: return ('ระวัง', '🟡', '#ffc107')
-    return              ('วิกฤต', '🔴', '#dc3545')
+    if pct >= 70: return ('ปกติ',       '🟢', '#28a745')
+    if pct >= 40: return ('เฝ้าระวัง', '🟡', '#f59e0b')
+    return              ('วิกฤต',      '🔴', '#dc3545')
+
+# ── กราฟจำลอง 24 ชม. ─────────────────────────────────────────────────────
+def make_sim_chart(init_pct: float, start_hour: int,
+                   cfg: dict, weather: dict | None) -> go.Figure:
+    """กราฟ dual-axis: line ระดับน้ำ (%) + bar จ่าย/ผลิต (ลบ.ม./ชม.)"""
+    demand_adj = get_demand_with_weather(cfg['demand'], weather) if weather else cfg['demand']
+    vol = CAPACITY * init_pct / 100
+
+    x_labels, levels, dems, prods, pump_colors = [], [], [], [], []
+
+    for i in range(25):   # 25 จุด = 24 ช่วง
+        h       = (start_hour + i) % 24
+        pct_now = vol / CAPACITY * 100
+        dem     = demand_adj[h]
+        _, prod, _, pc = get_pump_state(pct_now, cfg, dem)
+
+        x_labels.append(f'{h:02d}:00')
+        levels.append(round(pct_now, 2))
+        dems.append(round(dem, 1))
+        prods.append(prod)
+        pump_colors.append(pc)
+
+        vol = max(0.0, min(float(CAPACITY), vol + prod - dem))
+
+    fig = make_subplots(specs=[[{'secondary_y': True}]])
+
+    # แท่งผลิต (เขียว)
+    fig.add_trace(go.Bar(
+        x=x_labels[:-1], y=prods[:-1], name='ผลิต',
+        marker_color=[c.replace(')', ',0.75)').replace('rgb', 'rgba')
+                      if c.startswith('rgb') else c
+                      for c in pump_colors[:-1]],
+        marker=dict(color=['rgba(34,197,94,0.75)' if p > 0 else 'rgba(107,114,128,0.4)'
+                           for p in prods[:-1]]),
+        offsetgroup=0,
+    ), secondary_y=True)
+
+    # แท่งจ่าย (น้ำเงิน)
+    fig.add_trace(go.Bar(
+        x=x_labels[:-1], y=dems[:-1], name='จ่าย',
+        marker=dict(color='rgba(99,102,241,0.7)'),
+        offsetgroup=1,
+    ), secondary_y=True)
+
+    # เส้นระดับน้ำ (เขียวประ)
+    # สีเส้นเปลี่ยนตามระดับ
+    line_colors = ['#4ade80' if l >= 60 else ('#facc15' if l >= 50 else '#f87171')
+                   for l in levels]
+    fig.add_trace(go.Scatter(
+        x=x_labels, y=levels, name='ระดับน้ำ',
+        mode='lines+markers',
+        line=dict(color='#4ade80', width=2.5, dash='dot'),
+        marker=dict(size=7, color=line_colors,
+                    line=dict(color='#0d1117', width=1.5)),
+    ), secondary_y=False)
+
+    # เส้น threshold 90% / 70% / 40%
+    fig.add_hline(y=90, line_dash='dash',
+                  line=dict(color='rgba(14,165,233,0.45)', width=1.2),
+                  annotation_text='90% (1 เครื่อง)', annotation_font_color='#38bdf8',
+                  secondary_y=False)
+    fig.add_hline(y=70, line_dash='dash',
+                  line=dict(color='rgba(245,158,11,0.55)', width=1.2),
+                  annotation_text='70% (เฝ้าระวัง)', annotation_font_color='#fbbf24',
+                  secondary_y=False)
+    fig.add_hline(y=40, line_dash='dash',
+                  line=dict(color='rgba(239,68,68,0.55)', width=1.2),
+                  annotation_text='40% (วิกฤต)', annotation_font_color='#f87171',
+                  secondary_y=False)
+
+    # Layout
+    fig.update_layout(
+        title=dict(text='จำลอง 24 ชม. (ข้อมูลจริง MM01+DMA01)',
+                   font=dict(size=14, color='#e6edf3'), x=0),
+        barmode='group', bargap=0.15, bargroupgap=0.05,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(13,17,23,0.6)',
+        font=dict(color='#8b949e', size=11),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                    xanchor='right', x=1,
+                    font=dict(color='#e6edf3', size=11),
+                    bgcolor='rgba(0,0,0,0)'),
+        margin=dict(l=10, r=10, t=55, b=10),
+        height=360,
+        hovermode='x unified',
+    )
+    fig.update_xaxes(
+        gridcolor='rgba(255,255,255,0.05)',
+        tickfont=dict(size=10), tickangle=0,
+    )
+    fig.update_yaxes(
+        title_text='ระดับน้ำ (%)', range=[0, 108],
+        gridcolor='rgba(255,255,255,0.06)',
+        ticksuffix='%', secondary_y=False,
+        title_font=dict(color='#4ade80'), tickfont=dict(color='#4ade80'),
+    )
+    fig.update_yaxes(
+        title_text='ลบ.ม./ชม.', secondary_y=True,
+        gridcolor='rgba(0,0,0,0)',
+        title_font=dict(color='#818cf8'), tickfont=dict(color='#818cf8'),
+    )
+    return fig
+
+# ── กราฟระดับน้ำ filled-area ─────────────────────────────────────────────
+def make_level_chart(init_pct: float, start_hour: int,
+                     cfg: dict, weather: dict | None) -> go.Figure:
+    """กราฟระดับน้ำ (%) แบบ filled area พร้อมโซนสีตามสถานะ 24 ชม."""
+    demand_adj = get_demand_with_weather(cfg['demand'], weather) if weather else cfg['demand']
+    vol = CAPACITY * init_pct / 100
+
+    x_labels, levels = [], []
+    for i in range(25):
+        h       = (start_hour + i) % 24
+        pct_now = vol / CAPACITY * 100
+        dem     = demand_adj[h]
+        _, prod, _, _ = get_pump_state(pct_now, cfg, dem)
+        x_labels.append(f'{h:02d}:00')
+        levels.append(round(pct_now, 2))
+        vol = max(0.0, min(float(CAPACITY), vol + prod - dem))
+
+    dot_colors = ['#4ade80' if l >= 70 else ('#fbbf24' if l >= 40 else '#f87171')
+                  for l in levels]
+    fill_col = 'rgba(34,197,94,0.18)'   if init_pct >= 70 else \
+               ('rgba(245,158,11,0.18)' if init_pct >= 40 else 'rgba(239,68,68,0.18)')
+    line_col = '#4ade80' if init_pct >= 70 else ('#fbbf24' if init_pct >= 40 else '#f87171')
+
+    fig = go.Figure()
+
+    # โซนพื้นหลัง 3 ระดับ
+    fig.add_hrect(y0=0,   y1=40,  fillcolor='rgba(239,68,68,0.08)',  line_width=0)
+    fig.add_hrect(y0=40,  y1=70,  fillcolor='rgba(245,158,11,0.08)', line_width=0)
+    fig.add_hrect(y0=70,  y1=108, fillcolor='rgba(34,197,94,0.06)',  line_width=0)
+
+    # เส้น + fill ระดับน้ำ
+    fig.add_trace(go.Scatter(
+        x=x_labels, y=levels,
+        name='ระดับน้ำ',
+        mode='lines+markers',
+        fill='tozeroy',
+        fillcolor=fill_col,
+        line=dict(color=line_col, width=2.5),
+        marker=dict(size=6, color=dot_colors, line=dict(color='#0d1117', width=1.2)),
+        hovertemplate='%{x}  <b>%{y:.1f}%</b><extra></extra>',
+    ))
+
+    # จุดปัจจุบัน
+    fig.add_trace(go.Scatter(
+        x=[x_labels[0]], y=[levels[0]],
+        name='ตอนนี้',
+        mode='markers',
+        marker=dict(size=12, color=line_col, line=dict(color='#ffffff', width=2)),
+        hovertemplate=f'ตอนนี้  <b>{levels[0]:.1f}%</b><extra></extra>',
+    ))
+
+    # เส้น threshold — ใช้ shapes แทน add_hline เพื่อหลีกเลี่ยง annotation bug
+    thresholds = [
+        (90, 'rgba(56,189,248,0.5)',  '#38bdf8', '── 90%'),
+        (70, 'rgba(251,191,36,0.5)',  '#fbbf24', '── 70%'),
+        (40, 'rgba(248,113,113,0.5)', '#f87171', '── 40%'),
+    ]
+    for y_val, rgba_col, font_col, lbl in thresholds:
+        fig.add_shape(type='line', x0=0, x1=1, xref='paper',
+                      y0=y_val, y1=y_val,
+                      line=dict(color=rgba_col, width=1.2, dash='dash'))
+        fig.add_annotation(x=1, xref='paper', y=y_val,
+                           text=lbl, showarrow=False, xanchor='left',
+                           font=dict(color=font_col, size=10))
+
+    fig.update_layout(
+        title=dict(text='จำลองระดับน้ำ 24 ชม.',
+                   font=dict(size=14, color='#e6edf3'), x=0),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(13,17,23,0.6)',
+        font=dict(color='#8b949e', size=11),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                    xanchor='right', x=1,
+                    font=dict(color='#e6edf3', size=11),
+                    bgcolor='rgba(0,0,0,0)'),
+        margin=dict(l=10, r=50, t=50, b=10),
+        height=300,
+        hovermode='x unified',
+        yaxis=dict(
+            title='ระดับน้ำ (%)', range=[0, 108],
+            ticksuffix='%',
+            gridcolor='rgba(255,255,255,0.06)',
+            title_font=dict(color='#4ade80'),
+            tickfont=dict(color='#4ade80'),
+        ),
+        xaxis=dict(
+            gridcolor='rgba(255,255,255,0.05)',
+            tickfont=dict(size=10),
+        ),
+    )
+    return fig
+
 
 # ── Telegram ──────────────────────────────────────────────────────────────
 def build_telegram_msg(vol: float, hour: int, cfg: dict, ai_text: str = '') -> str:
@@ -253,14 +474,13 @@ def run_report():
         steps = (hour - state['lastHour']) % 24 or 1
         state['volume'] = sim_forward(state['volume'], state['lastHour'], steps, cfg, weather)
 
-    vol         = state['volume']
-    pct         = vol / CAPACITY * 100
-    depth       = vol / CAPACITY * TANK_H
-    prod        = cfg['prod_1_pump'] if vol >= CAPACITY else cfg['prod_2_pump']
-    pumps       = 1 if vol >= CAPACITY else 2
-    adj_demand  = get_demand_with_weather(cfg['demand'], weather)
-    dem         = adj_demand[hour]
-    net         = prod - dem
+    vol                    = state['volume']
+    pct                    = vol / CAPACITY * 100
+    depth                  = vol / CAPACITY * TANK_H
+    adj_demand             = get_demand_with_weather(cfg['demand'], weather)
+    dem                    = adj_demand[hour]
+    pumps, prod, p_label, _ = get_pump_state(pct, cfg, dem)
+    net                    = prod - dem
 
     # บันทึกลง DB
     record_to_db(now.isoformat(), hour, vol, pct, depth, pumps, prod, dem, net)
@@ -317,15 +537,18 @@ if state['lastHour'] not in (-1, hour):
     steps = (hour - state['lastHour']) % 24 or 1
     state['volume'] = sim_forward(state['volume'], state['lastHour'], steps, cfg, weather)
 
-vol        = state['volume']
-pct        = vol / CAPACITY * 100
-depth      = vol / CAPACITY * TANK_H
-prod       = cfg['prod_1_pump'] if vol >= CAPACITY else cfg['prod_2_pump']
-pumps      = 1 if vol >= CAPACITY else 2
-adj_demand = get_demand_with_weather(cfg['demand'], weather)
-out        = adj_demand[hour]
-net        = prod - out
-label, emoji, color = get_status(pct)
+vol                      = state['volume']
+pct                      = vol / CAPACITY * 100
+depth                    = vol / CAPACITY * TANK_H
+adj_demand               = get_demand_with_weather(cfg['demand'], weather)
+out                      = adj_demand[hour]
+pumps, prod, p_label, p_color = get_pump_state(pct, cfg, out)
+net                      = prod - out
+label, emoji, color      = get_status(pct)
+is_low_pressure          = hour in LOW_P
+is_critical              = pct < 40
+is_warning               = 40 <= pct < 70
+is_tank_full             = pct >= 100
 
 # ── Tabs ──────────────────────────────────────────────────────────────────
 tab_dash, tab_hist, tab_settings = st.tabs(['📊 Dashboard', '📈 ประวัติ', '⚙️ ตั้งค่า'])
@@ -334,9 +557,9 @@ tab_dash, tab_hist, tab_settings = st.tabs(['📊 Dashboard', '📈 ประว
 # Tab 1: Dashboard
 # ══════════════════════════════════
 with tab_dash:
-    badge_bg  = '#1a7f3c' if pct >= 60 else ('#a16207' if pct >= 50 else '#9f1239')
-    fill_top  = '#00e5ff' if pct >= 60 else ('#facc15' if pct >= 50 else '#f87171')
-    fill_bot  = '#0077b6' if pct >= 60 else ('#b45309' if pct >= 50 else '#dc2626')
+    badge_bg  = '#1a7f3c' if pct >= 70 else ('#a16207' if pct >= 40 else '#9f1239')
+    fill_top  = '#00e5ff' if pct >= 70 else ('#facc15' if pct >= 40 else '#f87171')
+    fill_bot  = '#0077b6' if pct >= 70 else ('#b45309' if pct >= 40 else '#dc2626')
     net_color = '#4ade80' if net >= 0 else '#f87171'
     ts_str    = now.strftime('%d/%m/%Y %H:%M น.')
     fill_pct  = min(pct, 100)
@@ -380,6 +603,8 @@ with tab_dash:
     <span class="db-tag">22×35×4 ม.</span>
     <span class="db-tag">{CAPACITY:,} ลบ.ม.</span>
     <span class="db-badge">{label}</span>
+    {'<span style="background:#1d4ed8;border-radius:6px;padding:3px 10px;font-size:.8rem;font-weight:600;color:#fff">🌙 ลดแรงดัน</span>' if is_low_pressure else ''}
+    {'<span style="background:#7c3aed;border-radius:6px;padding:3px 10px;font-size:.8rem;font-weight:600;color:#fff">⛽ ถังเต็ม</span>' if is_tank_full else ''}
   </div>
 </div>
 
@@ -399,6 +624,13 @@ with tab_dash:
       </div>
     </div>
     <div class="db-tank-base"></div>
+    <div style="margin-top:10px;text-align:center">
+      <div style="background:{p_color};border-radius:8px;padding:5px 10px;
+                  font-size:.78rem;font-weight:600;color:#fff;white-space:nowrap">
+        ⚙️ {p_label}
+      </div>
+      <div style="font-size:.72rem;color:#8b949e;margin-top:4px">{prod:,} ลบ.ม./ชม.</div>
+    </div>
   </div>
 
   <div class="db-cards">
@@ -457,19 +689,26 @@ with tab_dash:
     elif 'ไม่มี API key' in (w_err or ''):
         st.caption('🌡️ ยังไม่ได้ตั้งค่า OPENWEATHER_API_KEY — demand ใช้ค่า baseline')
 
-    if pct < 50:
-        st.error('⚠️ ระดับน้ำต่ำกว่า 50% — ต้องเดิน 2 เครื่องทันที!')
-    elif pct < 60:
-        st.warning('ระดับน้ำอยู่ในเกณฑ์ระวัง (50–60%)')
+    if is_critical:
+        st.error('🚨 วิกฤต! ระดับน้ำต่ำกว่า 40% — เดิน 2 เครื่องทันที! กรุณาตรวจสอบระบบ')
+    elif is_warning:
+        st.warning(f'🟡 เฝ้าระวัง ระดับน้ำ {pct:.1f}% — เดิน 2 เครื่อง ({prod:,} ลบ.ม./ชม.) ติดตามอย่างใกล้ชิด')
+    elif pct >= 100:
+        st.info('⛽ ถังเต็ม — หยุดเครื่องสูบน้ำ รอระดับลงถึง 90% จึงเริ่มสูบใหม่')
+    elif pct >= 90:
+        if out > 300:
+            st.warning(f'⚡ ระดับน้ำ {pct:.1f}% — demand สูง ({out:,.0f} ลบ.ม./ชม.) เดิน 2 เครื่อง ({prod:,} ลบ.ม./ชม.) รักษาระดับ 80–90%')
+        else:
+            st.info(f'💧 ระดับน้ำ {pct:.1f}% — เดิน 1 เครื่อง ({prod:,} ลบ.ม./ชม.) หากลงถึง 90% & demand >300 จะสูบ 2 เครื่อง')
 
     st.divider()
-    st.subheader('🔮 พยากรณ์ 8 ชั่วโมงข้างหน้า')
-    rows, v = [], vol
-    for i in range(9):
-        h = (hour + i) % 24
-        rows.append({'ชั่วโมง': f'{h:02d}:00', 'ระดับน้ำ (%)': round(v / CAPACITY * 100, 1)})
-        v = sim_forward(v, h, 1, cfg, weather)
-    st.line_chart(pd.DataFrame(rows).set_index('ชั่วโมง'), height=220)
+    # กราฟ 1: ระดับน้ำ (%) filled area
+    fig_level = make_level_chart(pct, hour, cfg, weather)
+    st.plotly_chart(fig_level, use_container_width=True)
+
+    # กราฟ 2: ผลิต vs จ่าย dual-axis
+    fig = make_sim_chart(pct, hour, cfg, weather)
+    st.plotly_chart(fig, use_container_width=True)
 
 # ══════════════════════════════════
 # Tab 2: ประวัติ
