@@ -274,7 +274,9 @@ def setup_summary_sheet(ss, log_ws, proj_ws, existing_titles):
     ws.update("B6", [['=IF(B3>0,B5/B3,0)']])
     ws.update("B7", [["=MAX(0,B3-40)"]])
 
-    ws.format("B3:B5,B7", {"numberFormat": {"type": "NUMBER", "pattern": "0.00"}})
+    num_fmt = {"numberFormat": {"type": "NUMBER", "pattern": "0.00"}}
+    for r in ["B3", "B4", "B5", "B7"]:
+        ws.format(r, num_fmt)
     ws.format("B6", {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}})
     ws.format("A3:A7", cell_format(bold=True))
 
