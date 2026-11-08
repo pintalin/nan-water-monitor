@@ -6,3 +6,7 @@ python-dotenv>=1.0.0
 apscheduler>=3.10.0
 pandas>=2.0.0
 pytz>=2024.1
+# Work Time Tracker — Google Sheets integration (optional)
+gspread>=6.0.0
+google-auth>=2.28.0
+google-auth-oauthlib>=1.2.0
