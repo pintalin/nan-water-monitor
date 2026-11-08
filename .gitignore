@@ -1,5 +1,8 @@
 # ไฟล์ลับ — ห้าม push ขึ้น GitHub
 .env
+credentials.json
+*.json.key
+work_tracker.db
 
 # ไฟล์ข้อมูล local (จะเก็บบน persistent volume แทน)
 state.json
